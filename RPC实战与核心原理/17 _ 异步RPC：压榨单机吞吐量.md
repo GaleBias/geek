@@ -1,0 +1,436 @@
+<audio title="17 _ 异步RPC：压榨单机吞吐量" src="https://static001.geekbang.org/resource/audio/88/1e/88c25b278ef567f4e7b7c50592f0831e.mp3" controls="controls"></audio> 
+<p>你好，我是何小锋。从今天开始，我们就正式进入高级篇了。</p><p>在上个篇章，我们学习了RPC框架的基础架构和一系列治理功能，以及一些与集群管理相关的高级功能，如服务发现、健康检查、路由策略、负载均衡、优雅启停机等等。</p><p>有了这些知识储备，你就已经对RPC框架有了较为充分的认识。但如果你想要更深入地了解RPC，更好地使用RPC，你就必须从RPC框架的整体性能上去考虑问题了。你得知道如何去提升RPC框架的性能、稳定性、安全性、吞吐量，以及如何在分布式的场景下快速定位问题等等，这些都是我们在高级篇中重点要讲解的内容。难度有一定提升，希望你能坚持学习呀！</p><p>那么今天我们就先来讲讲，RPC框架是如何压榨单机吞吐量的。</p><h2>如何提升单机吞吐量？</h2><p>在我运营RPC的过程中，“如何提升吞吐量”是我与业务团队经常讨论的问题。</p><p>记得之前业务团队反馈过这样一个问题：我们的TPS始终上不去，压测的时候CPU压到40%～50%就再也压不上去了，TPS也不会提高，问我们这里有没有什么解决方案可以提升业务的吞吐量？</p><p>之后我是看了下他们服务的业务逻辑，发现他们的业务逻辑在执行较为耗时的业务逻辑的基础上，又同步调用了好几个其它的服务。由于这几个服务的耗时较长，才导致这个服务的业务逻辑耗时也长，CPU大部分的时间都在等待，并没有得到充分地利用，因此CPU的利用率和服务的吞吐量当然上不去了。</p><!-- [[[read_end]]] --><p><strong>那是什么影响到了RPC调用的吞吐量呢？</strong></p><p>在使用RPC的过程中，谈到性能和吞吐量，我们的第一反应就是选择一款高性能、高吞吐量的RPC框架，那影响到RPC调用的吞吐量的根本原因是什么呢？</p><p>其实根本原因就是由于处理RPC请求比较耗时，并且CPU大部分的时间都在等待而没有去计算，从而导致CPU的利用率不够。这就好比一个人在干活，但他没有规划好时间，并且有很长一段时间都在闲着，当然也就完不成太多工作了。</p><p>那么导致RPC请求比较耗时的原因主要是在于RPC框架本身吗？事实上除非在网络比较慢或者使用方使用不当的情况下，否则，在大多数情况下，刨除业务逻辑处理的耗时时间，RPC本身处理请求的效率就算在比较差的情况下也不过是毫秒级的。可以说RPC请求的耗时大部分都是业务耗时，比如业务逻辑中有访问数据库执行慢SQL的操作。所以说，在大多数情况下，影响到RPC调用的吞吐量的原因也就是业务逻辑处理慢了，CPU大部分时间都在等待资源。</p><p>弄明白了原因，咱们就可以解决问题了，该如何去提升单机吞吐量？</p><p>这并不是一个新话题，比如现在我们经常提到的响应式开发，就是为了能够提升业务处理的吞吐量。要提升吞吐量，其实关键就两个字：“异步”。我们的RPC框架要做到完全异步化，实现全异步RPC。试想一下，如果我们每次发送一个异步请求，发送请求过后请求即刻就结束了，之后业务逻辑全部异步执行，结果异步通知，这样可以增加多么可观的吞吐量？</p><p>效果不用我说我想你也清楚了。那RPC框架都有哪些异步策略呢？</p><h2>调用端如何异步？</h2><p>说到异步，我们最常用的方式就是返回Future对象的Future方式，或者入参为Callback对象的回调方式，而Future方式可以说是最简单的一种异步方式了。我们发起一次异步请求并且从请求上下文中拿到一个Future，之后我们就可以调用Future的get方法获取结果。</p><p>就比如刚才我提到的业务团队的那个问题，他们的业务逻辑中调用了好几个其它的服务，这时如果是同步调用，假设调用了4个服务，每个服务耗时10毫秒，那么业务逻辑执行完至少要耗时40毫秒。</p><p>那如果采用Future方式呢？</p><p>连续发送4次异步请求并且拿到4个Future，由于是异步调用，这段时间的耗时几乎可以忽略不计，之后我们统一调用这几个Future的get方法。这样一来的话，业务逻辑执行完的时间在理想的情况下是多少毫秒呢？没错，10毫秒，耗时整整缩短到了原来的四分之一，也就是说，我们的吞吐量有可能提升4倍！</p><p><img src="https://static001.geekbang.org/resource/image/35/ef/359a5ef2c76c3a9ac84375e970915fef.jpg?wh=3412*1870" alt="" title="示意图"></p><p>那RPC框架的Future方式异步又该如何实现呢？</p><p>通过基础篇的学习，我们了解到，一次RPC调用的本质就是调用端向服务端发送一条请求消息，服务端收到消息后进行处理，处理之后响应给调用端一条响应消息，调用端收到响应消息之后再进行处理，最后将最终的返回值返回给动态代理。</p><p>这里我们可以看到，对于调用端来说，向服务端发送请求消息与接收服务端发送过来的响应消息，这两个处理过程是两个完全独立的过程，这两个过程甚至在大多数情况下都不在一个线程中进行。那么是不是说RPC框架的调用端，对于RPC调用的处理逻辑，内部实现就是异步的呢？</p><p>不错，对于RPC框架，无论是同步调用还是异步调用，调用端的内部实现都是异步的。</p><p>通过<a href="https://time.geekbang.org/column/article/199651">[第 02 讲]</a> 我们知道，调用端发送的每条消息都一个唯一的消息标识，实际上调用端向服务端发送请求消息之前会先创建一个Future，并会存储这个消息标识与这个Future的映射，动态代理所获得的返回值最终就是从这个Future中获取的；当收到服务端响应的消息时，调用端会根据响应消息的唯一标识，通过之前存储的映射找到对应的Future，将结果注入给那个Future，再进行一系列的处理逻辑，最后动态代理从Future中获得到正确的返回值。</p><p>所谓的同步调用，不过是RPC框架在调用端的处理逻辑中主动执行了这个Future的get方法，让动态代理等待返回值；而异步调用则是RPC框架没有主动执行这个Future的get方法，用户可以从请求上下文中得到这个Future，自己决定什么时候执行这个Future的get方法。</p><p><img src="https://static001.geekbang.org/resource/image/5d/55/5d6999a1ac6646faa34905539a0fba55.jpg?wh=2454*2049" alt="" title="Future示意图"></p><p>现在你应该很清楚RPC框架是如何实现Future方式的异步了。</p><h2>如何做到RPC调用全异步？</h2><p>刚才我讲解了Future方式的异步，Future方式异步可以说是调用端异步的一种方式，那么服务端呢？服务端是否需要异步，有什么实现方式？</p><p>通过基础篇的学习，我们了解到RPC服务端接收到请求的二进制消息之后会根据协议进行拆包解包，之后将完整的消息进行解码并反序列化，获得到入参参数之后再通过反射执行业务逻辑。那你有没有想过，在生产环境中这些操作都在哪个线程中执行呢？是在一个线程中执行吗？</p><p>当然不会在一个，对二进制消息数据包拆解包的处理是一定要在处理网络IO的线程中，如果网络通信框架使用的是Netty框架，那么对二进制包的处理是在IO线程中，而解码与反序列化的过程也往往在IO线程中处理，那服务端的业务逻辑呢？也应该在IO线程中处理吗？原则上是不应该的，业务逻辑应该交给专门的业务线程池处理，以防止由于业务逻辑处理得过慢而影响到网络IO的处理。</p><p>这时问题就来了，我们配置的业务线程池的线程数都是有限制的，在我运营RPC的经验中，业务线程池的线程数一般只会配置到200，因为在大多数情况下线程数配置到200还不够用就说明业务逻辑该优化了。那么如果碰到特殊的业务场景呢？让配置的业务线程池完全打满了，比如这样一个场景。</p><p>我这里启动一个服务，业务逻辑处理得就是比较慢，当访问量逐渐变大时，业务线程池很容易就被打满了，吞吐量很不理想，并且这时CPU的利用率也很低。</p><p>对于这个问题，你有没有想到什么解决办法呢？是不是会马上想到调大业务线程池的线程数？那这样可以吗？有没有更好的解决方式呢？</p><p>我想服务端业务处理逻辑异步是个好方法。</p><p>调大业务线程池的线程数，的确勉强可以解决这个问题，但是对于RPC框架来说，往往都会有多个服务共用一个线程池的情况，即使调大业务线程池，比较耗时的服务很可能还会影响到其它的服务。所以最佳的解决办法是能够让业务线程池尽快地释放，那么我们就需要RPC框架能够支持服务端业务逻辑异步处理，这对提高服务的吞吐量有很重要的意义。</p><p>那服务端如何支持业务逻辑异步呢？</p><p>这是个比较难处理的问题，因为服务端执行完业务逻辑之后，要对返回值进行序列化并且编码，将消息响应给调用端，但如果是异步处理，业务逻辑触发异步之后方法就执行完了，来不及将真正的结果进行序列化并编码之后响应给调用端。</p><p>这时我们就需要RPC框架提供一种回调方式，让业务逻辑可以异步处理，处理完之后调用RPC框架的回调接口，将最终的结果通过回调的方式响应给调用端。</p><p>说到服务端支持业务逻辑异步处理，结合我刚才讲解的Future方式异步，你有没有想到更好的处理方式呢？其实我们可以让RPC框架支持CompletableFuture，实现RPC调用在调用端与服务端之间完全异步。</p><p>CompletableFuture是Java8原生支持的。试想一下，假如RPC框架能够支持CompletableFuture，我现在发布一个RPC服务，服务接口定义的返回值是CompletableFuture对象，整个调用过程会分为这样几步：</p><ul>
+<li>服务调用方发起RPC调用，直接拿到返回值CompletableFuture对象，之后就不需要任何额外的与RPC框架相关的操作了（如我刚才讲解Future方式时需要通过请求上下文获取Future的操作），直接就可以进行异步处理；</li>
+<li>在服务端的业务逻辑中创建一个返回值CompletableFuture对象，之后服务端真正的业务逻辑完全可以在一个线程池中异步处理，业务逻辑完成之后再调用这个CompletableFuture对象的complete方法，完成异步通知；</li>
+<li>调用端在收到服务端发送过来的响应之后，RPC框架再自动地调用调用端拿到的那个返回值CompletableFuture对象的complete方法，这样一次异步调用就完成了。</li>
+</ul><p>通过对CompletableFuture的支持，RPC框架可以真正地做到在调用端与服务端之间完全异步，同时提升了调用端与服务端的两端的单机吞吐量，并且CompletableFuture是Java8原生支持，业务逻辑中没有任何代码入侵性，这是不是很酷炫了？</p><h2>总结</h2><p>今天我们主要讲解了如果通过RPC的异步去压榨单机的吞吐量。</p><p>影响到RPC调用的吞吐量的主要原因就是服务端的业务逻辑比较耗时，并且CPU大部分时间都在等待而没有去计算，导致CPU利用率不够，而提升单机吞吐量的最好办法就是使用异步RPC。</p><p>RPC框架的异步策略主要是调用端异步与服务端异步。调用端的异步就是通过Future方式实现异步，调用端发起一次异步请求并且从请求上下文中拿到一个Future，之后通过Future的get方法获取结果，如果业务逻辑中同时调用多个其它的服务，则可以通过Future的方式减少业务逻辑的耗时，提升吞吐量。服务端异步则需要一种回调方式，让业务逻辑可以异步处理，之后调用RPC框架提供的回调接口，将最终结果异步通知给调用端。</p><p>另外，我们可以通过对CompletableFuture的支持，实现RPC调用在调用端与服务端之间的完全异步，同时提升两端的单机吞吐量。</p><p>其实，RPC框架也可以有其它的异步策略，比如集成RxJava，再比如gRPC的StreamObserver入参对象，但CompletableFuture是Java8原生提供的，无代码入侵性，并且在使用上更加方便。如果是Java开发，让RPC框架支持CompletableFuture可以说是最佳的异步解决方案。</p><h2>课后思考</h2><p>对于RPC调用提升吞吐量这个问题，你是否还有其它的解决方案？你还能想到哪些RPC框架的异步策略？</p><p>欢迎留言分享你的答案，也欢迎你把文章分享给你的朋友，邀请他加入学习。我们下节课再见！</p>
+<style>
+    ul {
+      list-style: none;
+      display: block;
+      list-style-type: disc;
+      margin-block-start: 1em;
+      margin-block-end: 1em;
+      margin-inline-start: 0px;
+      margin-inline-end: 0px;
+      padding-inline-start: 40px;
+    }
+    li {
+      display: list-item;
+      text-align: -webkit-match-parent;
+    }
+    ._2sjJGcOH_0 {
+      list-style-position: inside;
+      width: 100%;
+      display: -webkit-box;
+      display: -ms-flexbox;
+      display: flex;
+      -webkit-box-orient: horizontal;
+      -webkit-box-direction: normal;
+      -ms-flex-direction: row;
+      flex-direction: row;
+      margin-top: 26px;
+      border-bottom: 1px solid rgba(233,233,233,0.6);
+    }
+    ._2sjJGcOH_0 ._3FLYR4bF_0 {
+      width: 34px;
+      height: 34px;
+      -ms-flex-negative: 0;
+      flex-shrink: 0;
+      border-radius: 50%;
+    }
+    ._2sjJGcOH_0 ._36ChpWj4_0 {
+      margin-left: 0.5rem;
+      -webkit-box-flex: 1;
+      -ms-flex-positive: 1;
+      flex-grow: 1;
+      padding-bottom: 20px;
+    }
+    ._2sjJGcOH_0 ._36ChpWj4_0 ._2zFoi7sd_0 {
+      font-size: 16px;
+      color: #3d464d;
+      font-weight: 500;
+      -webkit-font-smoothing: antialiased;
+      line-height: 34px;
+    }
+    ._2sjJGcOH_0 ._36ChpWj4_0 ._2_QraFYR_0 {
+      margin-top: 12px;
+      color: #505050;
+      -webkit-font-smoothing: antialiased;
+      font-size: 14px;
+      font-weight: 400;
+      white-space: normal;
+      word-break: break-all;
+      line-height: 24px;
+    }
+    ._2sjJGcOH_0 ._10o3OAxT_0 {
+      margin-top: 18px;
+      border-radius: 4px;
+      background-color: #f6f7fb;
+    }
+    ._2sjJGcOH_0 ._3klNVc4Z_0 {
+      display: -webkit-box;
+      display: -ms-flexbox;
+      display: flex;
+      -webkit-box-orient: horizontal;
+      -webkit-box-direction: normal;
+      -ms-flex-direction: row;
+      flex-direction: row;
+      -webkit-box-pack: justify;
+      -ms-flex-pack: justify;
+      justify-content: space-between;
+      -webkit-box-align: center;
+      -ms-flex-align: center;
+      align-items: center;
+      margin-top: 15px;
+    }
+    ._2sjJGcOH_0 ._10o3OAxT_0 ._3KxQPN3V_0 {
+      color: #505050;
+      -webkit-font-smoothing: antialiased;
+      font-size: 14px;
+      font-weight: 400;
+      white-space: normal;
+      word-break: break-word;
+      padding: 20px 20px 20px 24px;
+    }
+    ._2sjJGcOH_0 ._3klNVc4Z_0 {
+      display: -webkit-box;
+      display: -ms-flexbox;
+      display: flex;
+      -webkit-box-orient: horizontal;
+      -webkit-box-direction: normal;
+      -ms-flex-direction: row;
+      flex-direction: row;
+      -webkit-box-pack: justify;
+      -ms-flex-pack: justify;
+      justify-content: space-between;
+      -webkit-box-align: center;
+      -ms-flex-align: center;
+      align-items: center;
+      margin-top: 15px;
+    }
+    ._2sjJGcOH_0 ._3Hkula0k_0 {
+      color: #b2b2b2;
+      font-size: 14px;
+    }
+</style><ul><li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/0f/7b/98/8f1aecf4.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>楼下小黑哥</span>
+  </div>
+  <div class="_2_QraFYR_0">RPC 这里远程方法调用方式，大致可以分成四种方式：<br><br>- sync 默认方式，但是这只是『方法』内部同步，实际上 RPC 框架内部还是异步处理。<br>- future 方式，RPC 消费者得到 future，自行决定何时获取返回结果<br>- callback 方式，RPC 调用端不需要同步处理响应结果，可以直接返回。最后返回结果将会在回调线程异步处理<br>- oneway 方式，调用端发送请求之后不需要接受响应<br><br>其中 Dubbo 2.7 之后的版本，使用 CompletableFuture 提升异步的处理的能力，支持以上四种方式。<br><br><br></div>
+  <div class="_10o3OAxT_0">
+    <p class="_3KxQPN3V_0">作者回复: 总结的很好。</p>
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-04-04 21:51:09</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/1b/b4/62/771bed4b.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>vuiolpg</span>
+  </div>
+  <div class="_2_QraFYR_0">我觉得作者有一部分的描述会有点误导新人，就是CPU 大部分的时间都在等待，并没有得到充分地利用，因此 CPU 的利用率和服务的吞吐量当然上不去了这段话，其实线程处于等待状态时是不占用cpu资源的，所以更准确的描述应该是浪费了宝贵的线程资源，大量线程处于等待状态，可能（不是一定）导致cpu利用率低。</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-07-08 09:43:27</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/10/4c/8a/d75626ec.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>landon30</span>
+  </div>
+  <div class="_2_QraFYR_0">异步的最佳解决方案是coroutine</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-05-27 09:48:18</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/1c/34/9a/1587bc6f.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>JDY</span>
+  </div>
+  <div class="_2_QraFYR_0">老师说的是java版的rpc设计，我现在也知道了最好要用异步的方式来进行调用，但是c++的怎么实现呢？</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-04-15 22:50:18</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/10/01/37/12e4c9c9.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>高源</span>
+  </div>
+  <div class="_2_QraFYR_0">新的知识点，学习了老师讲的非常好，如果举个小的demo就更好了，主要调试程序理解知识点，点赞</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-03-30 06:02:29</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src=""
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>Geek_09d497</span>
+  </div>
+  <div class="_2_QraFYR_0">异步虽然能提高性能，但是遇到有的业务有先后顺序，如果所有请求异步，那如何保证时序呢</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-11-19 18:49:58</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/15/40/da/304a566e.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>rainj2013</span>
+  </div>
+  <div class="_2_QraFYR_0">我们直接用mq来做的通信，实现纯异步的rpc</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-06-19 21:58:48</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/1c/b5/a8/427a7b6d.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>石佩</span>
+  </div>
+  <div class="_2_QraFYR_0">使用异步的时候返回的速度变快了，但是后台所需要的线程数会变少么？，线程池我理解应该是该被打满还是被打满</div>
+  <div class="_10o3OAxT_0">
+    <p class="_3KxQPN3V_0">作者回复: 异步对于服务提供方来说，rpc线程所要处理的事情就变少了</p>
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-03-30 09:55:51</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/0f/8a/e3/11fd3b72.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>胡杨</span>
+  </div>
+  <div class="_2_QraFYR_0">RPC的服务提供方为了提高吞吐量，采用异步处理业务逻辑，这个我能理解。<br>文中说自定义线程池去异步处理业务逻辑，如果业务逻辑处理很慢，会把线程池打满，这个我也能理解。<br>但作者的意思是，为了让业务线程池尽快释放，可以采用CompletableFuture去异步处理，那业务逻辑慢的时候,CompletableFuture的线程池也是会被打满啊。用CompletableFuture异步处理，与我们自己用线程池去处理，我的理解是，用CompletableFuture可以降低一些异步编程的复杂度，但在性能效果方面有区别吗？</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2021-11-05 10:26:56</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/15/14/08/ac323169.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>Forsaken</span>
+  </div>
+  <div class="_2_QraFYR_0">利用任务编排来提高性能</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2021-06-14 12:21:24</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://thirdwx.qlogo.cn/mmopen/vi_32/DYAIOgq83ep66fdwo3ebSicKjf0iacAx4C2tZOthDDD4bSJqib1iauFBK6EoMSWUBp4UbbN2BQlib7mFR3hQD6MUwew/132"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>chai</span>
+  </div>
+  <div class="_2_QraFYR_0">go语言支持异步调用比较简单，新启动一个goroutine就行了</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2021-04-25 16:43:04</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/11/10/75/ff76024c.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>那个谁</span>
+  </div>
+  <div class="_2_QraFYR_0">rpc框架是作用于调用方服务方两端？实际上是在服务端有service, 客户端有client？然后客户端发起异步rpc调用，是说客户端本身不等待返回继续处理自身业务，而对服务端来讲，并不知道客户端是不是异步，然后服务端也是正常处理自己的业务逻辑。如果也是异步，那返回的结果是在服务端框架，然后服务端的rpc框架等完成后，返回给客户端？网络传输是不区分异步不异步，还是要等服务端执行完成，拿到正常结果后序列化到网络返回给调用方，是这么理解吗？</div>
+  <div class="_10o3OAxT_0">
+    <p class="_3KxQPN3V_0">作者回复: 应用层异步跟网络没有关系</p>
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2020-03-30 17:59:14</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/11/0e/ed/1c662e93.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>莫珣</span>
+  </div>
+  <div class="_2_QraFYR_0">我一直不太明白异步调用的代码要怎么写。比如文章中举的例子，调用端逻辑需要通过几个RPC才能实现自己的业务逻辑，但第一个RPC没拿到响应数据，就没办法执行后续的业务代码，那这样不就得同步调用了。</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2022-09-15 14:03:40</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/12/6d/8a/0f53c600.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>Palmer</span>
+  </div>
+  <div class="_2_QraFYR_0">老师您好！我之前在学习gRPC时了解到Streaming功能，就是回调方式的一种实现，但发现服务端哪怕单线程也无法保证请求的顺序（Netty IO模型造成）。比如调用端一次发送ABC，服务端可能会处理BAC。<br>请问老师，这种业务上有顺序要求的场景，如何在保证顺序处理的前提下使用异步来提升性能呢？谢谢！</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2022-08-17 22:12:40</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/13/e1/5a/d2081f1c.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>徐敏</span>
+  </div>
+  <div class="_2_QraFYR_0">用future不用协程，直接不会写代码。</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2022-06-20 09:24:32</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/28/86/dc/be1b17d8.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>Geek_648c53</span>
+  </div>
+  <div class="_2_QraFYR_0">有个疑惑，如果调用方需要多次调用服务，而且服务的多次调用有逻辑顺序的要求，且相互依赖，这样就导致即使异步处理，调用者也需要等待服务处理完毕才可以，有这样的需求的话，异步的用途也起不到太大的作用（不知道我理解的对不对）</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2022-05-13 15:24:36</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/15/22/f4/9fd6f8f0.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>核桃</span>
+  </div>
+  <div class="_2_QraFYR_0">全部使用异步进行调用，这里也会带来一个隐藏的问题，上下文切换。当服务请求很多的时候，虽然异步可以接受更多的请求。但是也意味着会有大量的上下文切换，这个问题也是致命的。因此一定要区分，哪些业务是可以异步，哪些业务是不需要异步的。否则得不偿失了。</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2022-02-13 17:32:20</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/0f/63/85/1dc41622.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>姑射仙人</span>
+  </div>
+  <div class="_2_QraFYR_0">老师，“调用端在收到服务端发送过来的响应之后”，在异步请求下，谁来发送这个响应？业务逻辑完成之后再调用这个 CompletableFuture 对象的 complete 方法，完成异步通知。这个complete 方法会触发响应吗？触发响应是要发起请求到调用端的吧。</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2021-05-19 18:35:41</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="http://thirdwx.qlogo.cn/mmopen/vi_32/DYAIOgq83er6OV33jHia3U9LYlZEx2HrpsELeh3KMlqFiaKpSAaaZeBttXRAVvDXUgcufpqJ60bJWGYGNpT7752w/132"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>dog_brother</span>
+  </div>
+  <div class="_2_QraFYR_0">c++的异步库，大家有啥推荐的么？</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2021-04-26 17:33:27</div>
+  </div>
+</div>
+</div>
+</li>
+<li>
+<div class="_2sjJGcOH_0"><img src="https://static001.geekbang.org/account/avatar/00/12/07/d2/0d7ee298.jpg"
+  class="_3FLYR4bF_0">
+<div class="_36ChpWj4_0">
+  <div class="_2zFoi7sd_0"><span>惘 闻</span>
+  </div>
+  <div class="_2_QraFYR_0">最重要的是因为CompletableFuture比Future多了complete回调方法对吗?这样才可以实现异步回调的响应</div>
+  <div class="_10o3OAxT_0">
+    
+  </div>
+  <div class="_3klNVc4Z_0">
+    <div class="_3Hkula0k_0">2021-02-02 10:10:11</div>
+  </div>
+</div>
+</div>
+</li>
+</ul>
